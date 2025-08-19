@@ -214,6 +214,7 @@ from sklearn.cluster import DBSCAN
 import numpy as np
 from scipy.signal import find_peaks
 
+
 def find_delay_estimates_with_clustering(P_music, tau_grid, P_true, Fs):
     # 1. **峰值检测**：先使用 find_peaks 找到显著的峰值
     adaptive_threshold = np.max(P_music) * 0.3
@@ -234,7 +235,7 @@ def find_delay_estimates_with_clustering(P_music, tau_grid, P_true, Fs):
         remaining_values = P_music[remaining_peaks]  # 获取未检测的谱值
 
         # 进行聚类，找到剩余的时延点
-        clustering = DBSCAN(eps=1e-9, min_samples=2).fit(remaining_peaks.reshape(-1, 1))
+        clustering = DBSCAN(eps=1e-9, min_samples=2).fit(remaining_values.reshape(-1, 1))  # 使用谱值进行聚类
         cluster_centers = []
 
         # 找到每个簇的中心
@@ -267,4 +268,5 @@ tau_hat = find_delay_estimates_with_clustering(P_music, tau_grid, P_true, Fs)
 
 # 打印结果
 print("估计的时延（ns）:", tau_hat * 1e9)
+
 
