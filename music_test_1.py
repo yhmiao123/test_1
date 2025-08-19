@@ -210,71 +210,61 @@ plt.title('MUSIC 算法用于多径时延估计')
 plt.tight_layout()
 plt.show()
 
-from scipy.signal import find_peaks
+from sklearn.cluster import DBSCAN
 import numpy as np
+from scipy.signal import find_peaks
 
-# 假设我们已经获得了 tau_grid 和 P_music
-# tau_grid 是时延网格，P_music 是MUSIC时延谱
+def find_delay_estimates_with_clustering(P_music, tau_grid, P_true, Fs):
+    # 1. **峰值检测**：先使用 find_peaks 找到显著的峰值
+    adaptive_threshold = np.max(P_music) * 0.3
+    min_sep_time = 0.1 / Fs
+    min_sep_sample = max(1, int(min_sep_time / (tau_grid[1] - tau_grid[0])))
+    peaks, _ = find_peaks(P_music, height=adaptive_threshold, distance=min_sep_sample, prominence=0.2)
 
-def find_delay_estimates(P_music, tau_grid, P_true, Fs):
-    # 1. **增强峰值检测的鲁棒性（自适应阈值 + 相对峰值检测）**
+    # 2. **如果峰值数量大于 P_true**：选择最强的 P_true 个峰值
+    if len(peaks) >= P_true:
+        sorted_peaks = np.argsort(P_music[peaks])[-P_true:]
+        tau_hat = tau_grid[peaks][sorted_peaks]
+    else:
+        # 3. **如果峰值数量小于 P_true**：使用聚类方法补充
+        tau_hat = tau_grid[peaks]  # 先存储已检测到的峰值
 
-    # 动态设定峰值的高度阈值
-    adaptive_threshold = np.max(P_music) * 0.3  # 设定为最大值的30%
-    
-    # 使用 find_peaks 检测峰值，最小间隔为 min_sep_sample，动态的阈值
-    min_sep_time = 0.1 / Fs  # 最小时间间隔
-    min_sep_sample = max(1, int(min_sep_time / (tau_grid[1] - tau_grid[0])))  # 转换为样本数
-    peaks, props = find_peaks(P_music, height=adaptive_threshold, distance=min_sep_sample, prominence=0.2)
+        # 聚类补充剩余的时延
+        remaining_peaks = np.delete(np.arange(len(P_music)), peaks)  # 获取未检测的峰值索引
+        remaining_values = P_music[remaining_peaks]  # 获取未检测的谱值
 
-    # 2. **频谱细化（双二次插值）**
+        # 进行聚类，找到剩余的时延点
+        clustering = DBSCAN(eps=1e-9, min_samples=2).fit(remaining_peaks.reshape(-1, 1))
+        cluster_centers = []
 
-    # 在选定的峰值上进行二次插值细化
-    def parabolic_refine(P_music, idx):
-        """二次差值细化，精确位置"""
-        xm1, x0, xp1 = P_music[idx-1], P_music[idx], P_music[idx+1]
-        denom = (xm1 - 2*x0 + xp1)
-        if np.abs(denom) < 1e-12:
-            return 0.0  # 如果分母接近零，返回0
-        delta = 0.5 * (xm1 - xp1) / denom
-        return delta
+        # 找到每个簇的中心
+        for label in set(clustering.labels_):
+            if label != -1:  # 排除噪声点
+                cluster_indices = np.where(clustering.labels_ == label)[0]
+                cluster_centroid = np.mean(remaining_peaks[cluster_indices])  # 计算每个簇的中心
+                cluster_centers.append(cluster_centroid)
 
-    tau_hat = []  # 存放最终估计的时延
+        # 4. **去重操作**：确保聚类中心点不与已有峰值重复
+        cluster_centers = np.array(cluster_centers)
+        valid_centers = []
 
-    # 使用二次插值细化峰值位置
-    for i in peaks:
-        if 1 <= i <= (len(tau_grid) - 2):  # 防止越界
-            delta = parabolic_refine(P_music, i)
-        else:
-            delta = 0.0  # 边界点不细化
+        for center in cluster_centers:
+            distances = np.abs(tau_grid[peaks] - tau_grid[remaining_peaks[center]])
+            if np.all(distances > 1):  # 阈值 1ns，避免重复峰值
+                valid_centers.append(center)
 
-        d_tau = tau_grid[1] - tau_grid[0]  # 网格间隔
-        tau_est = tau_grid[i] + delta * d_tau  # 计算细化后的时延
-        tau_hat.append(tau_est)
+        # 合并峰值：将补充的聚类中心加入到已检测峰值中
+        tau_hat = np.concatenate([tau_hat, tau_grid[valid_centers]])
 
-    tau_hat = np.array(tau_hat)
+        # 5. **确保时延数量为 P_true**：排序并返回前 P_true 个时延
+        tau_hat = np.sort(tau_hat)[:P_true]
 
-    # 3. **峰值融合（加权平均或聚类）**
+    return tau_hat
 
-    # 根据每个峰值的高度进行加权平均
-    if len(tau_hat) < P_true:
-        # 如果检测到的峰值少于 P_true 个，则尝试通过加权选择其他大的峰值
-        weights = P_music[peaks]
-        weighted_tau_hat = np.average(tau_grid[peaks], weights=weights)  # 使用加权平均
-        tau_hat = np.append(tau_hat, weighted_tau_hat)  # 添加加权值
-
-    # 如果发现峰值数量超过了 P_true，可以选择最强的 P_true 个峰值
-    if len(tau_hat) > P_true:
-        sorted_indices = np.argsort(P_music[peaks])[-P_true:]
-        tau_hat = tau_hat[sorted_indices]
-
-    tau_hat = np.sort(tau_hat)  # 排序时延估计
-
-    return tau_hat, P_music
-
-# 现在调用此函数来获取估计的时延
-P_true = 30  # 假设我们需要估计的时延数目
-tau_hat, P_music = find_delay_estimates(P_music, tau_grid, P_true, Fs)
+# 示例调用
+P_true = 30  # 需要估计的时延数目
+tau_hat = find_delay_estimates_with_clustering(P_music, tau_grid, P_true, Fs)
 
 # 打印结果
 print("估计的时延（ns）:", tau_hat * 1e9)
+
