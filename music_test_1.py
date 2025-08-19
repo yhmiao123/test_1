@@ -209,3 +209,72 @@ plt.ylabel('归一化P(τ)')
 plt.title('MUSIC 算法用于多径时延估计')
 plt.tight_layout()
 plt.show()
+
+from scipy.signal import find_peaks
+import numpy as np
+
+# 假设我们已经获得了 tau_grid 和 P_music
+# tau_grid 是时延网格，P_music 是MUSIC时延谱
+
+def find_delay_estimates(P_music, tau_grid, P_true, Fs):
+    # 1. **增强峰值检测的鲁棒性（自适应阈值 + 相对峰值检测）**
+
+    # 动态设定峰值的高度阈值
+    adaptive_threshold = np.max(P_music) * 0.3  # 设定为最大值的30%
+    
+    # 使用 find_peaks 检测峰值，最小间隔为 min_sep_sample，动态的阈值
+    min_sep_time = 0.1 / Fs  # 最小时间间隔
+    min_sep_sample = max(1, int(min_sep_time / (tau_grid[1] - tau_grid[0])))  # 转换为样本数
+    peaks, props = find_peaks(P_music, height=adaptive_threshold, distance=min_sep_sample, prominence=0.2)
+
+    # 2. **频谱细化（双二次插值）**
+
+    # 在选定的峰值上进行二次插值细化
+    def parabolic_refine(P_music, idx):
+        """二次差值细化，精确位置"""
+        xm1, x0, xp1 = P_music[idx-1], P_music[idx], P_music[idx+1]
+        denom = (xm1 - 2*x0 + xp1)
+        if np.abs(denom) < 1e-12:
+            return 0.0  # 如果分母接近零，返回0
+        delta = 0.5 * (xm1 - xp1) / denom
+        return delta
+
+    tau_hat = []  # 存放最终估计的时延
+
+    # 使用二次插值细化峰值位置
+    for i in peaks:
+        if 1 <= i <= (len(tau_grid) - 2):  # 防止越界
+            delta = parabolic_refine(P_music, i)
+        else:
+            delta = 0.0  # 边界点不细化
+
+        d_tau = tau_grid[1] - tau_grid[0]  # 网格间隔
+        tau_est = tau_grid[i] + delta * d_tau  # 计算细化后的时延
+        tau_hat.append(tau_est)
+
+    tau_hat = np.array(tau_hat)
+
+    # 3. **峰值融合（加权平均或聚类）**
+
+    # 根据每个峰值的高度进行加权平均
+    if len(tau_hat) < P_true:
+        # 如果检测到的峰值少于 P_true 个，则尝试通过加权选择其他大的峰值
+        weights = P_music[peaks]
+        weighted_tau_hat = np.average(tau_grid[peaks], weights=weights)  # 使用加权平均
+        tau_hat = np.append(tau_hat, weighted_tau_hat)  # 添加加权值
+
+    # 如果发现峰值数量超过了 P_true，可以选择最强的 P_true 个峰值
+    if len(tau_hat) > P_true:
+        sorted_indices = np.argsort(P_music[peaks])[-P_true:]
+        tau_hat = tau_hat[sorted_indices]
+
+    tau_hat = np.sort(tau_hat)  # 排序时延估计
+
+    return tau_hat, P_music
+
+# 现在调用此函数来获取估计的时延
+P_true = 30  # 假设我们需要估计的时延数目
+tau_hat, P_music = find_delay_estimates(P_music, tau_grid, P_true, Fs)
+
+# 打印结果
+print("估计的时延（ns）:", tau_hat * 1e9)
