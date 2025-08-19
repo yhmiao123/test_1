@@ -1,105 +1,211 @@
 import numpy as np
-import matplotlib.pyplot as plt
+from matplotlib import pyplot as plt
+from sionna.rt import load_scene, PlanarArray, Transmitter, Receiver, Camera,\
+                      PathSolver, RadioMapSolver, subcarrier_frequencies
+# 加载数据
+# 该版本是用得天线维度当做多观测
+load_path = r'.\Result\env_test1\results_MIMO_44_44_path.npy'
 
-# 参数设置
-f_c = 3e9  # 中心频率，3 GHz
-lambda_c = 3e8 / f_c  # 波长
-k = 2 * np.pi / lambda_c  # 波数
-d = 0.5 * lambda_c  # 振元间距，0.5个波长
-N_x = 64  # x轴阵列元素数（列数）
-N_y = 64  # y轴阵列元素数（行数）
-N_elements = N_x * N_y  # 阵列总元素数
-N_subcarriers = 1024  # 子载波数目（1024）
+# 加载数据（直接加载为字典）
+data = np.load(load_path, allow_pickle=True).item()
 
-# 设置角度网格
-azimuth_range = np.linspace(-np.pi, np.pi, 360)  # 方位角范围 -π 到 π，即 -180° 到 180°
-elevation_range = np.linspace(0, np.pi, 181)  # 俯仰角范围 0 到 π，即 0° 到 180°
+# 现在你可以访问里面的任意变量
+H_rt = data['H_rt']      # shape: (频点, 天线, 快照)
+h_rt = data['h_rt']      # shape: (频点, 天线, 快照)
+paths = data['paths']    # 可能是列表，每条路径包含 AOA/AOD/延迟/功率等信息
+tau = data['tau']
 
-# 构建阵列流形（空间导向向量）
-def steering_vector(azimuth, elevation, N_x, N_y, d, lambda_c):
-    # 阵列的振元位置坐标
-    y_positions = np.arange(N_y) * d  # y方向
-    z_positions = np.arange(N_x) * d  # z方向
-    a = np.zeros(N_elements, dtype=complex)  # 阵列流形初始化
+print("数据已成功加载！")
+print("H_rt shape:", H_rt.shape)
+print("h_rt shape:", h_rt.shape)
 
-    # 计算每个阵列元件的相位
-    for m in range(N_x):
-        for n in range(N_y):
-            y_n = y_positions[n]
-            z_m = z_positions[m]
-            
-            # 计算每个振元的相位变化
-            phase = np.exp(1j * k * (np.sin(elevation) * np.cos(azimuth) * y_n +
-                                     np.sin(elevation) * np.sin(azimuth) * z_m))  # 计算相位变化
-            a[m * N_y + n] = phase
-    return a
 
-# 读取Sionna计算的CFR矩阵 H_rt
-H_rt = np.load('H_rt.npy')  # 加载CFR矩阵，假设已经存储为Numpy文件
+subcarrier_spacing = 300e3   # 子载波间隔
 
-# MUSIC算法进行角度估计
-def music_algorithm(H_rt, N_x, N_y, lambda_c, d, azimuth_range, elevation_range):
-    P_music_azimuth = np.empty(len(azimuth_range), dtype=float)  # 存储方位角的P_music值
-    P_music_elevation = np.empty(len(elevation_range), dtype=float)  # 存储俯仰角的P_music值
-    P_music_joint = np.zeros((len(azimuth_range), len(elevation_range)))  # 联合谱矩阵
+num_subcarriers = 1024      # 子载波数量
+frequencies = subcarrier_frequencies(num_subcarriers, subcarrier_spacing)
+frequencies = frequencies.numpy()
 
-    # 计算协方差矩阵和特征值分解（循环外）
-    R = np.cov(H_rt)  # 协方差矩阵，取决于H_rt的维度
+Fs = frequencies[num_subcarriers-1]-frequencies[0]
+Ts = 1/Fs
+Ts_ns = Ts * 1e9  # 采样间隔 (10纳秒)
+tao_max=max(tau)/1e-9  #ns
+t_ns = np.arange(0, tao_max*5, Ts_ns)  # 时间轴 (纳秒)
+t = t_ns * 1e-9  # 转换为秒
+
+L=16*16  # 快拍数 越多协方差估计越稳定
+
+
+#-----------music算法函数------------
+def steering_vector(freqs,tau):
+    """
+    a_n(tao)=exp(-j2pi*f_n*tao)
+    """
+    return np.exp(-1j*2.0*np.pi*freqs*tau)  # shap(N_f,)
+
+def parabolic_refine(x,i):
+    xm1,x0,xp1=x[i-1],x[i],x[i+1]
+    denom=(xm1-2*x0+xp1)
+    if np.abs(denom)<1e-12:
+        return 0.0,float(x0)
+    delta=0.5*(xm1-xp1)/denom
+    peak_val=x0-0.25*(xm1-xp1)*delta
+    return float(delta),float(peak_val)
+
+def add_awgn_complex(X, snr_db):
+    sig_pow = np.mean(np.abs(X) ** 2)
+    noise_pow = sig_pow / (10 ** (snr_db / 10.0))
+    noise = (np.random.randn(*X.shape) + 1j * np.random.randn(*X.shape)) * np.sqrt(noise_pow / 2.0)
+    return X + noise
+
+
+def get_snapshots(H_rt):
+    a, b, c = H_rt.shape
+    if c == 0:
+        raise ValueError("输入数组的最后一个维度 c 必须大于 0")
+
+    # 转置轴顺序：(2, 0, 1) → (c, a, b)，然后 reshape
+    snapshots = H_rt.transpose(2, 0, 1).reshape(c, a * b)
+    return snapshots
+
+def music_delay_estimation(H_rt,P_true,N_f,num_snapshots,tau_grid):
+
+    target_snr_db = 10.0  # 调整信噪比
+
+    H_rt_noisy = add_awgn_complex(H_rt, target_snr_db)
+
+    snapshots=get_snapshots(H_rt_noisy)  # shap[N,L]
+
+    #计算协方差矩阵
+    R = (snapshots @ snapshots.conj().T)/num_snapshots  # shap[N,N]
+
+    # 特征值分解
     eigvals, eigvecs = np.linalg.eig(R)
-    sorted_indices = np.argsort(eigvals)
-    noise_subspace = eigvecs[:, sorted_indices[:-1]]  # 去除最大特征值，保留噪声子空间
-    
-    for i, azimuth in enumerate(azimuth_range):
-        for j, elevation in enumerate(elevation_range):
-            # 计算阵列流形
-            a_tau = steering_vector(azimuth, elevation, N_x, N_y, d, lambda_c)
-            
-            # 计算P_music值
-            y = np.dot(noise_subspace.T.conj(), a_tau)  # 计算y = EnH * a_tau
-            denom = np.abs(np.vdot(y, y))  # 计算分母
-            P_music_joint[i, j] = 1.0 / max(denom, 1e-20)  # 避免除零
 
-        # 计算方位角的P_music
-        a_tau_azimuth = steering_vector(azimuth, 0, N_x, N_y, d, lambda_c)  # 只考虑方位角
-        y_azimuth = np.dot(noise_subspace.T.conj(), a_tau_azimuth)
-        denom_azimuth = np.abs(np.vdot(y_azimuth, y_azimuth))
-        P_music_azimuth[i] = 1.0 / max(denom_azimuth, 1e-20)  # 避免除零
+    #  特征值降序排列
+    idx_desc = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[idx_desc]
+    eigvecs = eigvecs[:, idx_desc]
 
-    for j, elevation in enumerate(elevation_range):
-        # 计算俯仰角的P_music
-        a_tau_elevation = steering_vector(0, elevation, N_x, N_y, d, lambda_c)  # 只考虑俯仰角
-        y_elevation = np.dot(noise_subspace.T.conj(), a_tau_elevation)
-        denom_elevation = np.abs(np.vdot(y_elevation, y_elevation))
-        P_music_elevation[j] = 1.0 / max(denom_elevation, 1e-20)  # 避免除零
+    Es = eigvecs[:, :P_true]  # 信号子空间
+    En = eigvecs[:, P_true:]  # 噪声子空间
+    EnH = En.conj().T
 
-    return P_music_azimuth, P_music_elevation, P_music_joint, azimuth_range, elevation_range
+    P_music = np.empty(len(tau_grid), dtype=float)
+    for k, tau in enumerate(tau_grid):
+        a_tau = steering_vector(frequencies, tau)
+        y = EnH @ a_tau
+        denom = np.vdot(y, y).real
+        P_music[k] = 1.0 / max(denom, 1e-20)
 
-# 运行MUSIC算法
-P_music_azimuth, P_music_elevation, P_music_joint, azimuth_range, elevation_range = music_algorithm(H_rt, N_x, N_y, lambda_c, d, azimuth_range, elevation_range)
+    # 归一化画图
+    P_music /= np.max(P_music)
 
-# 绘制方位角的MUSIC谱
-plt.figure()
-plt.plot(np.degrees(azimuth_range), 10 * np.log10(P_music_azimuth))
-plt.title('MUSIC Spectrum for Azimuth')
-plt.xlabel('Azimuth Angle (degrees)')
-plt.ylabel('Power (dB)')
-plt.grid(True)
-plt.show()
+    try:
+        from scipy.signal import find_peaks
+        min_sep_time = 0.1 / Fs
+        min_sep_sample = max(1, int(min_sep_time / (tau_grid[1] - tau_grid[0])))
+        peaks, props = find_peaks(P_music, distance=min_sep_sample, height=0.3)
 
-# 绘制俯仰角的MUSIC谱
-plt.figure()
-plt.plot(np.degrees(elevation_range), 10 * np.log10(P_music_elevation))
-plt.title('MUSIC Spectrum for Elevation')
-plt.xlabel('Elevation Angle (degrees)')
-plt.ylabel('Power (dB)')
-plt.grid(True)
-plt.show()
+        if len(peaks) >= P_true:
+            top = np.argsort(P_music[peaks])[-P_true:]
+            peak_idx = np.sort(peaks[top])
+        else:
+            # peak_idx = np.argsort(P_music)[-P_true:]
+            # peak_idx.sort()
+            top = np.argsort(P_music[peaks])[-P_true:]  # 取前 P_true 个，不够就全取
+            peak_idx = np.sort(peaks[top])
 
-# 绘制联合谱（方位角 vs 俯仰角）
-plt.figure()
-plt.imshow(10 * np.log10(P_music_joint), aspect='auto', cmap='jet', origin='lower', extent=[np.degrees(azimuth_range[0]), np.degrees(azimuth_range[-1]), np.degrees(elevation_range[0]), np.degrees(elevation_range[-1])])
-plt.title('Joint MUSIC Spectrum (Azimuth vs Elevation)')
-plt.xlabel('Azimuth Angle (degrees)')
-plt.ylabel('Elevation Angle (degrees)')
-plt.colorbar(label='Power (dB)')
+            # 剩余需要补的数量
+            need_more = P_true - len(peak_idx)
+
+            if need_more > 0:
+                # 在 P_music 中找出不在 peak_idx 中的最大值位置
+                # 先构建一个 mask：排除已经选过的索引
+                mask = np.ones(len(P_music), dtype=bool)
+                mask[peak_idx] = False  # 排除已选中的索引
+
+                # 在非 peak_idx 的位置中找最大的 need_more 个值
+                candidate_indices = np.where(mask)[0]
+                candidate_values = P_music[candidate_indices]
+
+                # 找最大的 need_more 个值的索引
+                top_candidates = np.argsort(candidate_values)[-need_more:][::-1]  # 从大到小
+                new_peaks = candidate_indices[top_candidates]
+
+                # 合并新选的峰值
+                peak_idx = np.concatenate([peak_idx, new_peaks])
+                peak_idx.sort()  # 最后统一排序
+    except Exception:
+        cand = np.where((P_music[1:-1]) > P_music[:-2] & (P_music[1:-1] > P_music[2:0]))[0] + 1
+        if len(cand) >= P_true:
+            peak_idx = cand[np.argsort(P_music[cand])][-P_true:]
+            peak_idx.sort()
+        else:
+            peak_idx = np.argsort(P_music)[-P_true:]
+            peak_idx.sort()
+
+    # 二次差值细化峰位置
+    tau_hat = []
+    for i in peak_idx:
+        if 1 <= i <= (len(tau_grid) - 2):
+            delta, _ = parabolic_refine(P_music, i)
+        else:
+            delta = 0.0
+        # 网格间隔
+        d_tau = tau_grid[1] - tau_grid[0]
+        tau_est = tau_grid[i] + delta * d_tau
+        tau_hat.append(tau_est)
+    tau_hat = np.array(tau_hat)
+
+    return tau_hat, P_music
+
+#-------------主函数进行music估计-----------
+P_true=30  #需要估计的时延数目
+
+tau_min=0.0
+tau_max=500e-9  # 最大时延230ns 扫描0-500ns的
+N_tau=501  # 扫描网格数 扫描间隔为1e-9  1ns
+tau_grid=np.linspace(tau_min,tau_max,N_tau)  #shap(N_tau)
+
+tau_hat, P_music = music_delay_estimation(H_rt=H_rt,P_true=P_true,N_f=num_subcarriers,num_snapshots=L,tau_grid=tau_grid)
+
+sorted_tau_ns = np.sort(tau * 1e9)  # 先转为 ns，再排序
+print("排序后的实时延 (ns):", sorted_tau_ns)
+print(" 估计时延 (ns):", tau_hat*1e9)
+
+plt.rcParams['font.family'] = 'Microsoft YaHei'
+plt.rcParams['axes.unicode_minus'] = False
+
+
+#  画图 1）原始cir图 2）music时延谱  3）进行了峰值提取后的music时延谱
+plt.figure(figsize=(10, 6))
+plt.subplot(311)
+h_rt=h_rt[1,1,:]
+plt.stem(tau/1e-9, np.abs(h_rt), basefmt="b-", linefmt="b-", markerfmt="bo")
+plt.title("理想的 CIR (无限时延分辨率)")
+plt.xlabel("时延 (ns)")
+plt.ylabel("幅度")
+plt.xlim(-25, 525)  # 强制 x 从 0 开始，上限为最大延迟
+
+plt.subplot(312)
+plt.stem(tau_grid*1e9, P_music,  basefmt="b-", linefmt="b-", markerfmt="bo")
+plt.grid(True, alpha=0.3)
+plt.xlabel('时延 τ (ns)')
+plt.ylabel('归一化P(τ)')
+plt.title('MUSIC 算法用于多径时延估计')
+
+plt.subplot(313)
+plt.plot(tau_grid*1e9, P_music, 'b-', linewidth=1.5, label='MUSIC 时延谱')
+# 添加标注
+# for t in tau_hat:
+#     idx=np.argmin(np.abs(tau_grid-t))
+#     plt.plot(t*1e9,P_music[idx],'rx',markersize=10)
+#     plt.text(t*1e9,P_music[idx]+0.05,f"{t*1e9:.3f}ns",color='r',ha='center',fontsize=9)
+
+plt.grid(True, alpha=0.3)
+plt.xlabel('时延 τ (ns)')
+plt.ylabel('归一化P(τ)')
+plt.title('MUSIC 算法用于多径时延估计')
+plt.tight_layout()
 plt.show()
